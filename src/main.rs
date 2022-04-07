@@ -1,15 +1,16 @@
 use anyhow::Result;
 use pixels::{Pixels, SurfaceTexture};
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use winit::dpi::PhysicalSize;
 use winit::event::{Event, VirtualKeyCode};
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowBuilder;
 use winit_input_helper::WinitInputHelper;
 
-use log::{info, warn};
-use notify::{raw_watcher, Op, RecursiveMode, Watcher};
+use log::warn;
+use notify::{Op, ReadDirectoryChangesWatcher, RecursiveMode, Watcher, raw_watcher};
 use pixels::wgpu::Color;
 use std::sync::mpsc::channel;
 use std::thread;
@@ -18,8 +19,8 @@ use tiny_skia::Pixmap;
 use usvg::{Options, Tree};
 
 struct State {
-    file: PathBuf,
-
+    file: Option<PathBuf>,
+    _watcher: Option<ReadDirectoryChangesWatcher>,
     options: Options,
     pixels: Pixmap,
     svg_data: Tree,
@@ -34,12 +35,19 @@ fn main() -> Result<()> {
 
     // CLI
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
+    if args.len() > 2 {
         println!("Usage:\n\tsvgview <path-to-svg>");
         std::process::exit(0);
     }
-    let file = std::fs::canonicalize(&args[1]).expect("Failed to interpret argument as path!");
-
+    let raw_svg = if args.len() == 1 || args[1] == "-"{
+	RawSVG::from_stdin()
+	    .expect("Failed to read SVG from stdin!")
+    } else {
+	let svg_path = std::fs::canonicalize(&args[1])
+	    .expect("Failed to interpret path as file!");
+	RawSVG::from_file(&svg_path)
+	    .expect("Failed to read SVG from file!")
+    };
     // DISPLAY WINDOW
     let event_loop = EventLoop::<()>::with_user_event();
     let mut input = WinitInputHelper::new();
@@ -51,37 +59,21 @@ fn main() -> Result<()> {
             .unwrap()
     };
 
-    // APPLICATION STATE
-    let window_size = window.inner_size();
-    let mut state = State::new(file.clone(), window_size);
 
     // PIXEL BUFFER
     let mut pixels = {
-        let window_size = window.inner_size();
-        let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
+	let window_size = window.inner_size();
+        let surface_texture = SurfaceTexture::new(
+	    window.inner_size().width,
+	    window.inner_size().height,
+	    &window);
         Pixels::new(window_size.width, window_size.height, surface_texture)?
     };
     pixels.set_clear_color(Color::WHITE);
 
-    // FILE WATCHER
-    let (tx, rx) = channel();
-    let mut watcher = raw_watcher(tx).expect("Could not create filesystem watcher!");
-    watcher
-        .watch(file, RecursiveMode::NonRecursive)
-        .expect("Could not start filesystem watcher!");
-
+    // APPLICATION STATE
     let evp = event_loop.create_proxy();
-    thread::spawn(move || loop {
-        match rx.recv() {
-            Ok(event) => {
-                if let Ok(Op::CLOSE_WRITE) = event.op {
-                    evp.send_event(())
-                        .expect("Failed to notify UI of file write!");
-                }
-            }
-            Err(e) => warn!("watch error: {:?}", e),
-        }
-    });
+    let mut state = State::new(raw_svg, window.inner_size(), evp);
 
     // INTERFACE EVENT LOOP
     event_loop.run(move |event, _, control_flow| {
@@ -128,27 +120,74 @@ fn main() -> Result<()> {
     });
 }
 
-impl State {
-    fn new(file: PathBuf, window_size: PhysicalSize<u32>) -> Self {
-        let mut opt = usvg::Options {
-            resources_dir: file.parent().map(|p| p.to_path_buf()),
+struct RawSVG{
+    original_path: Option<PathBuf>,
+    document: usvg::Tree,
+    opts: Options
+}
+
+impl RawSVG{
+    pub fn from_file(file_path: &Path) -> Result<Self>{
+	// let file_data = std::fs::read(&file).expect("Could not read input file!");
+	let mut svg = std::fs::File::open(file_path)
+	    .expect("Failed to open input file for reading!");
+
+	let mut opts = usvg::Options {
+            resources_dir: Some(file_path.to_path_buf()),
             ..Default::default()
         };
-        opt.fontdb.load_system_fonts();
+        opts.fontdb.load_system_fonts();
+	let mut file_data = vec![];
+	svg.read_to_end(&mut file_data)?;
+	let document = usvg::Tree::from_data(&file_data, &opts.to_ref())?;
+	Ok(Self{original_path: Some(file_path.to_path_buf()), document, opts})
+    }
+    pub fn from_stdin() -> Result<Self>{
+	let mut opts = usvg::Options::default();
+        opts.fontdb.load_system_fonts();
+	let mut file_data = vec![];
+	std::io::stdin().read_to_end(&mut file_data)?;
+	let document = usvg::Tree::from_data(&file_data, &opts.to_ref())?;
+	Ok(Self{original_path: None, document, opts})
+    }
+}
 
-        let file_data = std::fs::read(&file).expect("Could not read input file!");
-        let svg_data =
-            usvg::Tree::from_data(&file_data, &opt.to_ref()).expect("Could not parse data as SVG!");
+impl State {
+    fn new(svg: RawSVG, window_size: PhysicalSize<u32>, evp: EventLoopProxy<()>) -> Self {
+	// FILE WATCHER
+	let watcher = svg.original_path.clone()
+	    .map(|path|{
+		let (tx, rx) = channel();
+		let mut watcher = raw_watcher(tx)
+		    .expect("Could not create filesystem watcher!");
+		watcher
+		    .watch(path, RecursiveMode::NonRecursive)
+		    .expect("Could not start filesystem watcher!");
 
+		thread::spawn(move || loop {
+		    match rx.recv() {
+			Ok(event) => {
+			    if let Ok(Op::CLOSE_WRITE) = event.op {
+				evp.send_event(())
+				    .expect("Failed to notify UI of file write!");
+			    }
+			}
+			Err(e) => warn!("watch error: {:?}", e),
+		    }
+		});
+
+		watcher
+	    });
         let mut state = Self {
-            file,
+	    _watcher: watcher,
+            file: svg.original_path,
             width: window_size.width,
             height: window_size.height,
 
-            options: opt,
+            options: svg.opts,
             pixels: Pixmap::new(window_size.width, window_size.height)
                 .expect("Could not allocate memory for display!"),
-            svg_data,
+            svg_data: svg.document,
         };
         state.rasterize_svg();
         state
@@ -163,10 +202,12 @@ impl State {
     }
 
     fn handle_file_change(&mut self) {
-        let svg_data = std::fs::read(&self.file).expect("Could not read input file!");
-        self.svg_data = usvg::Tree::from_data(&svg_data, &self.options.to_ref())
-            .expect("Could not parse data as SVG!");
-        self.rasterize_svg();
+	if let Some(file) = &self.file{
+            let svg_data = std::fs::read(&file).expect("Could not read input file!");
+            self.svg_data = usvg::Tree::from_data(&svg_data, &self.options.to_ref())
+		.expect("Could not parse data as SVG!");
+            self.rasterize_svg();
+	}
     }
 
     fn rasterize_svg(&mut self) {
